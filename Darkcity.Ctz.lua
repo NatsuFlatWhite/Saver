@@ -11,6 +11,8 @@ local patrolRoutes = require "Darkcity.Patrols"
 local startPositions = {"-628.9 -500.5 100.3", "-387.9 1086.9 64.1", "1511 -760.4 46.8"}
 
 local boxNames = {"nos", "sp", "transparent", "hp"}
+local boxEffects = {nos = "Item_Boo", sp = "Saver_SPRecover",
+    transparent = "Saver_Antizombie", hp = "Saver_Recover"}
 local soulPersons = {168, 169, 170, 171, 173}
 local setNpc, clearBugs
 
@@ -120,7 +122,8 @@ local function eatBox(game, player, idx)
     game.raw:sendDeleteItemBox(nil, {idx})
     if box.name == "nos" then
 
-        game.raw:addRpmPenalty(player.id, -0.25, 10000)
+        game.raw:sendSkillUsing(player.id, 103, {spentSp = 0, waitTime = 0,
+            affectTime = 10, param1 = 100, param2 = 1000, param3 = 0, param4 = 0})
     elseif box.name == "sp" then
         game.raw:increaseSP(player.id, 100)
     elseif box.name == "transparent" then
@@ -139,6 +142,7 @@ local function eatBox(game, player, idx)
         end
         game.raw:sendSetNpcHp(player.id, damages)
     end
+    game.raw:setRelementEffect(player.id, boxEffects[box.name])
 
 end
 
@@ -167,6 +171,20 @@ local function updateAttr(game, player)
     }})
 end
 
+local function comboValue(game, team, now)
+    local combo = game.combo[team]
+    if not combo then return 0 end
+    local chargeMs = math.floor(combo.count * 1000 + 0.5)
+    return math.max(0, chargeMs - math.max(0, Tick__Sub(now, combo.tick))) / 1000
+end
+
+local function comboSnapshot(game, init)
+    local now = Tick__Cur()
+    return {init = init and 1 or 0, round = game.round, tick = now,
+        count1 = comboValue(game, 1, now), count2 = comboValue(game, 2, now),
+        count3 = comboValue(game, 3, now), count4 = comboValue(game, 4, now)}
+end
+
 local function publishRank(game, final)
     local sorted, teams, totals, order, teamOrder, resultTeams = {}, {}, {}, {}, {}, {}
     for id, player in pairs(game.players) do
@@ -193,7 +211,7 @@ local function publishRank(game, final)
         end)
     end
 
-    if game.teamCount > 1 then game.raw:sendRank(order, order, teamOrder, resultTeams)
+    if game.teamCount > 1 then game.raw:sendRank(order, order, teamOrder, resultTeams, comboSnapshot(game))
     else game.raw:sendRank(order, order) end
     return sorted, final and resultTeams or teamOrder, final and totals or teams
 end
@@ -311,8 +329,28 @@ local function handlePlayEvent(game, event)
         end
         if npc.kind == "friendly" then
             local slot
-            for i = 1, 5 do if not player.slots[i] then slot = i; break end end
-            if not slot then game.raw:sendNpcHitResult(id, npc.idx, false); return end
+            local lowest, lowestPoint
+            for i = 1, 5 do
+                local passenger = player.slots[i]
+                if passenger then
+                    decayPassenger(player, passenger, now)
+                    if passenger.hp <= 0 then
+                        detach(game, passenger, NPC:Movement_Die(), true)
+                        if not slot then slot = i end
+                    else
+                        local point = soulValue(game, passenger)
+                        if not lowestPoint or point < lowestPoint then lowest, lowestPoint = i, point end
+                    end
+                elseif not slot then slot = i end
+            end
+            if not slot then
+                if soulValue(game, npc) <= lowestPoint then
+                    game.raw:sendNpcHitResult(id, npc.idx, false)
+                    return
+                end
+                slot = lowest
+                detach(game, player.slots[slot], NPC:Movement_Die(), true)
+            end
             player.slots[slot] = npc
             npc.owner, npc.slot, npc.hp, npc.hpTick, npc.point = id, slot, 300, now, npc.basePoint
             if npc.site then
@@ -367,8 +405,7 @@ local function handlePlayEvent(game, event)
             return
         end
         local combo = game.combo[player.team] or {count = 0, tick = now}
-        local elapsed = math.max(0, Tick__Sub(now, combo.tick))
-        combo.count = math.max(0, combo.count - math.floor(elapsed / 1000))
+        combo.count = comboValue(game, player.team, now)
         local bonus = game.teamCount > 1 and (1 + math.min(4, math.floor(combo.count / 5)) * 0.25) or 1
         local points = 0
         for _, npc in ipairs(souls) do
@@ -610,7 +647,7 @@ local function playRound(thread, game)
         return false
     end
 
-    if game.teamCount > 1 then raw:sendRank({}, {}, {1, 2, 3, 4}, {1, 2, 3, 4}) end
+    if game.teamCount > 1 then raw:sendRank({}, {}, {1, 2, 3, 4}, {1, 2, 3, 4}, comboSnapshot(game, true)) end
     for id in pairs(game.players) do
         raw:sendStart(id, param, {region = game.region, pos = game.pos})
     end
